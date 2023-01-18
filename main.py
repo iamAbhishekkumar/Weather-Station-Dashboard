@@ -1,12 +1,17 @@
-from machine import Pin, UART
+from machine import Pin, UART, ADC, I2C
 import utime
 import time
-import urequests
+from esp8266 import ESP8266
 import ujson
+import ure
+from bmp280 import *
+from dht import DHT11, InvalidChecksum
+from time import sleep
 
-
-gpsModule = UART(0, baudrate=9600, tx=Pin(0), rx=Pin(1))
+gpsModule = UART(1, baudrate=9600, tx=Pin(4), rx=Pin(5))
 buff = bytearray(255)
+
+esp01 = ESP8266()
 
 TIMEOUT = False
 FIX_STATUS = False
@@ -16,13 +21,37 @@ longitude = ""
 satellites = ""
 GPStime = ""
 
+bus = I2C(0,scl=Pin(17),sda=Pin(16),freq=200000)
+bmp = BMP280(bus)
+bmp.use_case(BMP280_CASE_WEATHER)
 
+Raindrop_AO = ADC(0)
+
+pin = Pin(28, Pin.OUT, Pin.PULL_DOWN)
+sensor = DHT11(pin)
+
+
+def startWifi():
+    print("StartUP", esp01.startUP())
+    print("Echo-Off", esp01.echoING())
+
+    esp01.setCurrentWiFiMode()
+
+    print("Try to connect with the WiFi..")
+    while (1):
+        if "WIFI CONNECTED" in esp01.connectWiFi("POCO", "abhishek"):
+            print("ESP8266 connect with the WiFi..")
+            break
+        else:
+            print(".")
+            time.sleep(2)
+            
+            
 def getGPS(gpsModule):
     global FIX_STATUS, TIMEOUT, latitude, longitude, satellites, GPStime
 
     timeout = time.time() + 10
     while True:
-        print(gpsModule.readline())
         buff = str(gpsModule.readline())
         parts = buff.split(',')
 
@@ -57,48 +86,92 @@ def convertToDegree(RawDegrees):
     return str(Converted)
 
 
-getGPS(gpsModule)
+def getCoord():
+    global FIX_STATUS
+    getGPS(gpsModule)
+    if(FIX_STATUS == True):
+        FIX_STATUS = False
+        return (latitude, longitude)
 
-if(FIX_STATUS == True):
-    print("Printing GPS data...")
-    print(" ")
-    print("Latitude: "+latitude)
-    print("Longitude: "+longitude)
-    print("Satellites: " + satellites)
-    print("Time: "+GPStime)
-    print("----------------------")
+    return None
 
-    FIX_STATUS = False
+def postDataWithGPS(lat, long, temp, atp, humidity, rain):
+    path = f'/postgpsweather?lat={lat}&long={long}&temp={temp}&atp={atp}&humidity={humidity}&rain={rain}'
+    statusCode, res = esp01.doHttpGet(
+        "http://iotgroup6.pythonanywhere.com",path, "RPi-Pico",port=80)
+    res = esp01.doHttpCustom("iotgroup6.pythonanywhere.com", path, "RaspberryPi-Pico",port=80)
+    print(res)
+    
+def postDataWithoutGPS(temp, atp, humidity, rain):
+    ip = getip()
+    path = f"/postweather?ip={ip}&temp={temp}&atp={atp}&humidity={humidity}&rain={rain}"
+    res = esp01.doHttpCustom("iotgroup6.pythonanywhere.com", path, "RaspberryPi-Pico",port=80)
+    print(res)
 
-if(TIMEOUT == True):
-    print("No GPS data is found.")
-    TIMEOUT = False
-    # GETTING LOCATION BASED ON IP LOCATION
+def getip():
+    statusCode, res = esp01.doHttpGet("www.httpbin.org","/ip","RaspberryPi-Pico", port=80)
+    if statusCode == 200:
+        #print(res)
+        res = ure.search("{(.*?)\}",res).group(0)
+        #print(repr(res))
+        res = res.replace("\\n","")
+        #print(repr(res))
+        res = ujson.loads(res)
+        print(res)
+        return res['origin']
+    
+def work():
+    temp, humidity = getDHTData()
+    atp = getPressure()
+    rain = isRain()   
+    val = getCoord()
+    if val:
+        postDataWithGPS(val[0],val[1],temp,atp,humidity,rain)
+    else:
+        print((temp,atp,humidity,rain))
+        postDataWithoutGPS(temp,atp,humidity,rain)
 
-    response.close()
+def isRain():
+    adc_Raindrop = Raindrop_AO.read_u16()
+    if adc_Raindrop < 30000:
+        return 1
+    else:
+        return 0
+
+def getPressure():
+    try:
+        atp = None
+        pressure=bmp.pressure
+        atp = pressure / 100
+        return atp
+    except:
+        print("Error in pressuare")
+        return 1000
+
+def getDHTData():
+    try:
+        t  = (sensor.temperature)
+        h = (sensor.humidity)
+    except:
+        t = 25
+        h = 70
+    return t,h
+
+if __name__ == '__main__':
+    startWifi()
+    iter = 5
+    while iter > 0:
+        work()
+        sleep(15)
+        iter -= 1
+    esp01.disconnectWiFi()
+    
 
 
-def getloc():
-    url = 'https://api.bigdatacloud.net/data/client-ip'
-    apiKey = 'EEtLXfqiwOLYtaPpGuxLfzGzHzzn55TQ'
-    ip = urequests.get(
-        "https://api.bigdatacloud.net/data/client-ip").json()['ipString']
-
-    geo_url = 'https://api.apilayer.com/ip_to_location/' + ip
-    res = urequests.get(geo_url, headers={"apiKey": apiKey})
-    return (res['latitude'], res['longitude'])
 
 
-def postdata():
-    url = ""
-    lat, long = getloc()
-    data = {
-        'temp': 0,
-        'humidity': 23,
-        'atp': 23433,
-        'rain': False,
-        'lat': lat
-        'long': long
-    }
-    data = ujson.dumps(data)
-    urequests.post(url, data=post_data)
+
+
+
+
+
